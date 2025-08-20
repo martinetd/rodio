@@ -44,13 +44,18 @@ pub struct OutputStream {
     config: OutputStreamConfig,
     mixer: Mixer,
     log_on_drop: bool,
-    _stream: cpal::Stream,
+    stream: cpal::Stream,
 }
 
 impl OutputStream {
     /// Access the output stream's mixer.
     pub fn mixer(&self) -> &Mixer {
         &self.mixer
+    }
+
+    /// Access the output stream's underlying cpal Stream.
+    pub fn stream(&self) -> &cpal::Stream {
+        &self.stream
     }
 
     /// Access the output stream's config.
@@ -487,7 +492,7 @@ impl OutputStream {
         Self::init_stream(device, config, source, error_callback).and_then(|stream| {
             stream.play().map_err(StreamError::PlayStreamError)?;
             Ok(Self {
-                _stream: stream,
+                stream: stream,
                 mixer: controller,
                 config: *config,
                 log_on_drop: true,
