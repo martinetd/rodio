@@ -44,7 +44,7 @@ pub struct OutputStream {
     config: OutputStreamConfig,
     mixer: Mixer,
     log_on_drop: bool,
-    _stream: cpal::Stream,
+    stream: cpal::Stream,
 }
 
 impl OutputStream {
@@ -62,6 +62,17 @@ impl OutputStream {
     /// emitted through tracing if the tracing feature is enabled.
     pub fn log_on_drop(&mut self, enabled: bool) {
         self.log_on_drop = enabled;
+    }
+
+    /// Pause the underlying cpal::stream
+    /// This stops the mixer from being consumed
+    pub fn pause(&self) -> Result<(), cpal::PauseStreamError> {
+        self.stream.pause()
+    }
+
+    /// Resume cpal::stream playback if it was paused
+    pub fn resume(&self) -> Result<(), cpal::PlayStreamError> {
+        self.stream.play()
     }
 }
 
@@ -487,7 +498,7 @@ impl OutputStream {
         Self::init_stream(device, config, source, error_callback).and_then(|stream| {
             stream.play().map_err(StreamError::PlayStreamError)?;
             Ok(Self {
-                _stream: stream,
+                stream: stream,
                 mixer: controller,
                 config: *config,
                 log_on_drop: true,
