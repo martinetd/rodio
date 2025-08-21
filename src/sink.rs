@@ -24,6 +24,8 @@ pub struct Sink {
     sound_count: Arc<AtomicUsize>,
 
     detached: bool,
+    mixer: Option<Mixer>,
+    mixer_idx: Option<usize>,
 }
 
 struct SeekOrder {
@@ -70,8 +72,9 @@ impl Sink {
     /// Builds a new `Sink`, beginning playback on a stream.
     #[inline]
     pub fn connect_new(mixer: &Mixer) -> Sink {
-        let (sink, source) = Sink::new();
-        mixer.add(source);
+        let (mut sink, source) = Sink::new();
+        sink.mixer = Some(mixer.clone());
+        sink.mixer_idx = Some(mixer.add(source));
         sink
     }
 
@@ -94,6 +97,8 @@ impl Sink {
             }),
             sound_count: Arc::new(AtomicUsize::new(0)),
             detached: false,
+            mixer: None,
+            mixer_idx: None,
         };
         (sink, queue_rx)
     }
@@ -209,6 +214,9 @@ impl Sink {
     #[inline]
     pub fn play(&self) {
         self.controls.pause.store(false, Ordering::SeqCst);
+        if let Some(mixer) = &self.mixer {
+            mixer.play_source(self.mixer_idx.unwrap())
+        }
     }
 
     // There is no `can_seek()` method as it is impossible to use correctly. Between
@@ -261,6 +269,9 @@ impl Sink {
     /// A paused sink can be resumed with `play()`.
     pub fn pause(&self) {
         self.controls.pause.store(true, Ordering::SeqCst);
+        if let Some(mixer) = &self.mixer {
+            mixer.pause_source(self.mixer_idx.unwrap())
+        }
     }
 
     /// Gets if a sink is paused

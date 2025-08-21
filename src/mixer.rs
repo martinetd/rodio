@@ -3,7 +3,8 @@
 use crate::common::{ChannelCount, SampleRate};
 use crate::source::{SeekError, Source, UniformSourceIterator};
 use crate::Sample;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -21,17 +22,19 @@ use std::time::Duration;
 pub fn mixer(channels: ChannelCount, sample_rate: SampleRate) -> (Mixer, MixerSource) {
     let input = Mixer(Arc::new(Inner {
         has_pending: AtomicBool::new(false),
-        pending_sources: Mutex::new(Vec::new()),
+        pending_sources: Mutex::new(HashMap::new()),
+        current_sources: Mutex::new(HashMap::with_capacity(16)),
+        paused_sources: Mutex::new(HashMap::new()),
+        idx: AtomicUsize::new(0),
         channels,
         sample_rate,
     }));
 
     let output = MixerSource {
-        current_sources: Vec::with_capacity(16),
         input: input.clone(),
         sample_count: 0,
-        still_pending: vec![],
-        still_current: vec![],
+        still_pending: HashMap::new(),
+        still_current: HashMap::new(),
     };
 
     (input, output)
@@ -43,7 +46,11 @@ pub struct Mixer(Arc<Inner>);
 
 struct Inner {
     has_pending: AtomicBool,
-    pending_sources: Mutex<Vec<Box<dyn Source + Send>>>,
+    pending_sources: Mutex<HashMap<usize, Box<dyn Source + Send>>>,
+    // The current iterator that produces samples.
+    current_sources: Mutex<HashMap<usize, Box<dyn Source + Send>>>,
+    paused_sources: Mutex<HashMap<usize, Box<dyn Source + Send>>>,
+    idx: AtomicUsize,
     channels: ChannelCount,
     sample_rate: SampleRate,
 }
@@ -51,26 +58,49 @@ struct Inner {
 impl Mixer {
     /// Adds a new source to mix to the existing ones.
     #[inline]
-    pub fn add<T>(&self, source: T)
+    pub fn add<T>(&self, source: T) -> usize
     where
         T: Source + Send + 'static,
     {
         let uniform_source =
             UniformSourceIterator::new(source, self.0.channels, self.0.sample_rate);
+        let idx = self.0.idx.fetch_add(1, Ordering::SeqCst); // TODO: ordering?
         self.0
             .pending_sources
             .lock()
             .unwrap()
-            .push(Box::new(uniform_source) as Box<_>);
+            .insert(idx, Box::new(uniform_source) as Box<_>);
+        // XXX panic or print something if  ^ is not none?
+        self.0.has_pending.store(true, Ordering::SeqCst); // TODO: can we relax this ordering?
+        idx
+    }
+
+    // called when a mixed source is paused
+    pub(crate) fn pause_source(&self, idx: usize) {
+        if let Some(source) = self.0.current_sources.lock().unwrap().remove(&idx) {
+            self.0.paused_sources.lock().unwrap().insert(idx, source);
+            return;
+        };
+        if let Some(source) = self.0.pending_sources.lock().unwrap().remove(&idx) {
+            self.0.paused_sources.lock().unwrap().insert(idx, source);
+            return;
+        };
+    }
+
+    // called when a mixed source is resumed
+    pub(crate) fn play_source(&self, idx: usize) {
+        let Some(source) = self.0.paused_sources.lock().unwrap().remove(&idx) else {
+            // not playing, nothing to do
+            return;
+        };
+        // pop back to pending sources
+        self.0.pending_sources.lock().unwrap().insert(idx, source);
         self.0.has_pending.store(true, Ordering::SeqCst); // TODO: can we relax this ordering?
     }
 }
 
 /// The output of the mixer. Implements `Source`.
 pub struct MixerSource {
-    // The current iterator that produces samples.
-    current_sources: Vec<Box<dyn Source + Send>>,
-
     // The pending sounds.
     input: Mixer,
 
@@ -78,10 +108,10 @@ pub struct MixerSource {
     sample_count: usize,
 
     // A temporary vec used in start_pending_sources.
-    still_pending: Vec<Box<dyn Source + Send>>,
+    still_pending: HashMap<usize, Box<dyn Source + Send>>,
 
     // A temporary vec used in sum_current_sources.
-    still_current: Vec<Box<dyn Source + Send>>,
+    still_current: HashMap<usize, Box<dyn Source + Send>>,
 }
 
 impl Source for MixerSource {
@@ -112,6 +142,7 @@ impl Source for MixerSource {
         })
 
         // uncomment when #510 is implemented (query position of playback)
+        // (also needs fixingto get self.input.0.current_sources.lock().unwrap())
 
         // let mut org_positions = Vec::with_capacity(self.current_sources.len());
         // let mut encounterd_err = None;
@@ -155,7 +186,7 @@ impl Iterator for MixerSource {
 
         let sum = self.sum_current_sources();
 
-        if self.current_sources.is_empty() {
+        if self.input.0.current_sources.lock().unwrap().is_empty() {
             None
         } else {
             Some(sum)
@@ -175,14 +206,15 @@ impl MixerSource {
     // sound will play on the wrong channels, e.g. left / right will be reversed.
     fn start_pending_sources(&mut self) {
         let mut pending = self.input.0.pending_sources.lock().unwrap(); // TODO: relax ordering?
+        let mut current = self.input.0.current_sources.lock().unwrap();
 
-        for source in pending.drain(..) {
+        for (idx, source) in pending.drain() {
             let in_step = self.sample_count % source.channels() as usize == 0;
 
             if in_step {
-                self.current_sources.push(source);
+                current.insert(idx, source);
             } else {
-                self.still_pending.push(source);
+                self.still_pending.insert(idx, source);
             }
         }
         std::mem::swap(&mut self.still_pending, &mut pending);
@@ -196,13 +228,14 @@ impl MixerSource {
 
     fn sum_current_sources(&mut self) -> Sample {
         let mut sum = 0.0;
-        for mut source in self.current_sources.drain(..) {
+        let mut current = self.input.0.current_sources.lock().unwrap();
+        for (idx, mut source) in current.drain() {
             if let Some(value) = source.next() {
                 sum += value;
-                self.still_current.push(source);
+                self.still_current.insert(idx, source);
             }
         }
-        std::mem::swap(&mut self.still_current, &mut self.current_sources);
+        std::mem::swap(&mut self.still_current, &mut current);
 
         sum
     }
